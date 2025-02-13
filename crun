@@ -1,0 +1,254 @@
+#!/bin/bash
+
+# ======================== CONFIGURATION ======================== #
+DEFAULT_OPTIMIZATION="-O2"
+SANITIZE_MODE=false
+VERBOSE_MODE=false
+KEEP_BINARY=false
+DEBUG_MODE=false
+PROFILE_MODE=false
+OUTPUT_DIR="/tmp/crun-bin"
+USE_MAKE=false
+FORCE_INSTALL=false
+
+# Dependencies to be managed
+DEPENDENCIES=("gcc" "g++" "make" "clang-tidy" "cppcheck" "valgrind" "gprof" "binutils")
+
+# ========================== FUNCTIONS ========================== #
+
+show_usage() {
+    cat << EOF
+Usage: crun [OPTIONS] <source_file> [program_args...]
+
+Description:
+  crun is a powerful script to compile, analyze, and run C/C++ programs with ease.
+  It supports advanced features like static analysis, sanitizers, profiling, and more.
+  It also automatically manages dependencies to ensure a smooth experience.
+
+Options:
+  --help
+      Show this help message and exit.
+
+  --keep
+      Keep the compiled binary after execution (default: delete after execution).
+
+  --debug, -d
+      Compile with debug symbols (-g) for debugging purposes.
+
+  --sanitize, -s
+      Enable AddressSanitizer and UndefinedBehaviorSanitizer for runtime error detection.
+
+  --profile, -p
+      Enable profiling with gprof to analyze program performance.
+
+  --verbose, -v
+      Show detailed compilation and execution output.
+
+  -O0|-O1|-O2|-O3
+      Set the optimization level (default: -O2).
+
+  --outdir <dir>
+      Set the output directory for compiled binaries (default: /tmp/crun-bin).
+
+  --static
+      Compile as a statically linked binary.
+
+  --lint
+      Run static analysis using clang-tidy and cppcheck to check code quality.
+
+  --install
+      Force installation of all required dependencies (gcc, clang-tidy, valgrind, etc.).
+
+Examples:
+  1. Compile and run a C program:
+     crun program.c
+
+  2. Compile with debug symbols and keep the binary:
+     crun --debug --keep program.c
+
+  3. Enable sanitizers and run static analysis:
+     crun --sanitize --lint program.c
+
+  4. Compile with maximum optimization and profile the program:
+     crun -O3 --profile program.c
+
+  5. Force install all dependencies:
+     crun --install
+
+Dependencies Managed:
+  - Compilers: gcc, g++, clang
+  - Build tools: make, binutils
+  - Static analysis: clang-tidy, cppcheck
+  - Profiling: gprof
+  - Runtime analysis: valgrind
+
+Notes:
+  - The script automatically detects the file extension (.c or .cpp) and selects the appropriate compiler.
+  - If a Makefile is present, it will use 'make' for compilation.
+  - Missing dependencies are automatically installed (Linux Mint/Ubuntu/Debian only).
+
+Report issues or contribute at: https://github.com/0Bleak/crun
+EOF
+    exit 0
+}
+
+log() { [[ "$VERBOSE_MODE" == true ]] && echo "[crun] $1"; }
+
+error_exit() { echo "[ERROR] $1"; exit 1; }
+
+parse_options() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --help) show_usage ;;
+            --keep) KEEP_BINARY=true ;;
+            --debug|-d) DEBUG_MODE=true ;;
+            --sanitize|-s) SANITIZE_MODE=true ;;
+            --profile|-p) PROFILE_MODE=true ;;
+            --verbose|-v) VERBOSE_MODE=true ;;
+            --static) STATIC_MODE=true ;;
+            --lint) LINT_MODE=true ;;
+            --install) FORCE_INSTALL=true ;;
+            -O0|-O1|-O2|-O3) DEFAULT_OPTIMIZATION="$1" ;;
+            --outdir) shift; OUTPUT_DIR="$1" ;;
+            -*) error_exit "Unknown option: $1";;
+            *) source_file="$1"; shift; program_args=("$@"); break ;;
+        esac
+        shift
+    done
+}
+
+# ========================== DEPENDENCY MANAGEMENT ========================== #
+
+check_and_install() {
+    local package=$1
+    if ! command -v "$package" &>/dev/null; then
+        echo "Installing $package..."
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get install -y "$package" || error_exit "Failed to install $package."
+        else
+            error_exit "Unsupported package manager. Please install $package manually."
+        fi
+    fi
+}
+
+check_dependencies() {
+    echo "Checking and installing dependencies..."
+    for package in "${DEPENDENCIES[@]}"; do
+        check_and_install "$package"
+    done
+    echo "All dependencies are installed."
+    [[ "$source_file" == "" ]] && exit 0
+}
+
+# ========================== SETUP ========================== #
+
+detect_source_file() {
+    [[ "$source_file" != *.* ]] && source_file="$source_file.c"
+
+    if [[ ! -f "$source_file" ]]; then
+        error_exit "Source file '$source_file' not found."
+    fi
+}
+
+set_compiler() {
+    filename="${source_file%.*}"
+    extension="${source_file##*.}"
+
+    case "$extension" in
+        c)   compiler="gcc"; alt_compiler="clang" ;;
+        cpp) compiler="g++"; alt_compiler="clang++" ;;
+        *)   error_exit "Unsupported file extension '$extension'. Only .c or .cpp allowed." ;;
+    esac
+
+    if ! command -v "$compiler" &>/dev/null; then
+        if ! command -v "$alt_compiler" &>/dev/null; then
+            error_exit "No suitable compiler found. Run 'crun --install' to install required dependencies."
+        fi
+        compiler="$alt_compiler"
+    fi
+}
+
+set_compilation_flags() {
+    CFLAGS=(
+        "$DEFAULT_OPTIMIZATION"
+        "-pipe"
+        "-Wall"
+        "-Wextra"
+        "-Werror"
+        "-pthread"
+        "-march=native"
+    )
+
+    [[ "$DEBUG_MODE" == true ]] && CFLAGS+=("-g")
+    [[ "$SANITIZE_MODE" == true ]] && CFLAGS+=("-fsanitize=address" "-fsanitize=undefined")
+    [[ "$PROFILE_MODE" == true ]] && CFLAGS+=("-pg")
+    [[ "$STATIC_MODE" == true ]] && CFLAGS+=("-static")
+
+    mkdir -p "$OUTPUT_DIR"
+    binary_path="$OUTPUT_DIR/$filename"
+}
+
+# ========================== COMPILATION ========================== #
+
+run_static_analysis() {
+    if [[ "$LINT_MODE" == true ]]; then
+        log "Running static analysis..."
+        if ! command -v clang-tidy &>/dev/null || ! command -v cppcheck &>/dev/null; then
+            error_exit "Static analysis tools not found. Run 'crun --install' to install them."
+        fi
+        clang-tidy "$source_file" -- -std=c11 &>/dev/null || true
+        cppcheck --enable=all --quiet "$source_file" || true
+    fi
+}
+
+compile_with_make() {
+    log "Makefile detected, using make..."
+    make -j"$(nproc)" &>/dev/null || error_exit "Make failed."
+    exec "./$filename" "${program_args[@]}"
+    exit 0
+}
+
+compile_source() {
+    compile_cmd=("$compiler" "${CFLAGS[@]}" "$source_file" -o "$binary_path")
+
+    log "Compiling with: ${compile_cmd[*]}"
+    
+    if ! "${compile_cmd[@]}" 2>&1 | (if [[ "$VERBOSE_MODE" == true ]]; then cat; else grep -v 'warning:' || true; fi); then
+        error_exit "Compilation failed."
+    fi
+    
+    log "Compilation successful."
+}
+
+# ========================== EXECUTION & CLEANUP ========================== #
+
+cleanup() {
+    [[ "$KEEP_BINARY" == false ]] && log "Cleaning up binary: $binary_path" && rm -f "$binary_path"
+}
+trap cleanup EXIT SIGINT SIGTERM
+
+execute_binary() {
+    log "Running: $binary_path ${program_args[*]}"
+    "$binary_path" "${program_args[@]}"
+    exit_code=$?
+    log "Program exited with code: $exit_code"
+    exit $exit_code
+}
+
+# ========================== MAIN EXECUTION ========================== #
+
+parse_options "$@"
+[[ "$FORCE_INSTALL" == true ]] && check_dependencies
+[[ "$source_file" == "" ]] && show_usage
+detect_source_file
+set_compiler
+set_compilation_flags
+run_static_analysis
+
+if [[ -f "Makefile" || -f "makefile" ]]; then
+    compile_with_make
+else
+    compile_source
+fi
+
+execute_binary
